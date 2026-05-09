@@ -1,8 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
-from PIL import Image
+from PIL import Image, ImageOps
 import imagehash
-import cv2
-import numpy as np
 import clip
 import torch
 import io
@@ -13,28 +11,12 @@ device = "cpu"
 model, preprocess = clip.load("ViT-B/32", device=device)
 
 def preprocess_image(image_bytes: bytes) -> Image.Image:
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    binary = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY, 11, 2
-    )
-    inverted = cv2.bitwise_not(binary)
-    coords = cv2.findNonZero(inverted)
-    if coords is not None:
-        x, y, w, h = cv2.boundingRect(coords)
-        padding = 15
-        x = max(0, x - padding)
-        y = max(0, y - padding)
-        w = min(img.shape[1] - x, w + 2*padding)
-        h = min(img.shape[0] - y, h + 2*padding)
-        cropped = binary[y:y+h, x:x+w]
-    else:
-        cropped = binary
-    resized = cv2.resize(cropped, (256, 256))
-    return Image.fromarray(resized)
+    # Load image with Pillow, normalize orientation, convert to grayscale
+    img = Image.open(io.BytesIO(image_bytes)).convert("L")
+    img = ImageOps.exif_transpose(img)
+    # Deterministic resize to 256x256
+    img = img.resize((256, 256), Image.LANCZOS)
+    return img
 
 
 @app.post("/phash")
