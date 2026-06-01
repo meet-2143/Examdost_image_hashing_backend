@@ -1,7 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import Response
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
-from fastapi.responses import Response
 from PIL import Image, ImageOps
 import imagehash
 import clip
@@ -12,7 +10,14 @@ import io
 app = FastAPI()
 
 device = "cpu"
-model, preprocess = clip.load("ViT-B/32", device=device)
+_clip_model = None
+_clip_preprocess = None
+
+def _get_clip():
+    global _clip_model, _clip_preprocess
+    if _clip_model is None:
+        _clip_model, _clip_preprocess = clip.load("ViT-B/32", device=device)
+    return _clip_model, _clip_preprocess
 
 import matplotlib
 matplotlib.use('Agg')
@@ -63,7 +68,37 @@ async def render_graph(request: Request):
     return Response(content=png_bytes, media_type="image/png")
 
 
+def _normalize_graph_spec(spec: dict) -> dict:
+    """Absorb LLM field-name variations so renderers see canonical keys."""
+    spec = dict(spec)
+    normalized = []
+    for s in spec.get("shapes", []):
+        s = dict(s)
+        if s.get("type") == "arrow":
+            # start/end arrays  (most common LLM variant)
+            # from/to arrays    (alternate LLM variant)
+            for src_key, xk, yk in [("start", "x1", "y1"), ("end",  "x2", "y2"),
+                                     ("from",  "x1", "y1"), ("to",   "x2", "y2"),
+                                     ("origin","x1", "y1"), ("tip",  "x2", "y2")]:
+                if src_key in s:
+                    pt = s[src_key]
+                    if isinstance(pt, (list, tuple)):
+                        s.setdefault(xk, float(pt[0]))
+                        s.setdefault(yk, float(pt[1]))
+                    elif isinstance(pt, dict):
+                        s.setdefault(xk, float(pt.get("x", 0)))
+                        s.setdefault(yk, float(pt.get("y", 0)))
+        elif s.get("type") == "polygon":
+            if "vertices" in s and "points" not in s:
+                s["points"] = s["vertices"]
+        normalized.append(s)
+    spec["shapes"] = normalized
+    # Normalise element type strings for circuit passthrough safety
+    return spec
+
+
 def draw_graph(spec: dict) -> bytes:
+    spec = _normalize_graph_spec(spec)
     graph_type = spec.get("type", "graph")
     # Waveform / multi-curve plots need more horizontal room
     default_w = 10 if graph_type == "waveform" else 7
@@ -77,6 +112,7 @@ def draw_graph(spec: dict) -> bytes:
     title      = spec.get("title", "")
     xlabel     = spec.get("xlabel", "")
     ylabel     = spec.get("ylabel", "")
+    spec_has_xrange = "xrange" in spec
     xrange     = spec.get("xrange", [-10, 10])
     yrange     = spec.get("yrange", None)
     curves     = spec.get("curves", [])
@@ -154,7 +190,81 @@ def draw_graph(spec: dict) -> bytes:
 
         ax.set_aspect("equal")
         ax.autoscale()
-        
+
+    # ── Draw phasor diagram ───────────────────────────────────────────────────
+    if graph_type == "phasor":
+        shapes = spec.get("shapes", [])  # already normalized by _normalize_graph_spec
+
+        # Resolve arrow tip coordinates once (supports polar + cartesian forms)
+        resolved = []
+        for s in shapes:
+            s = dict(s)
+            if s.get("type") == "arrow":
+                x1 = s.get("x1", 0)
+                y1 = s.get("y1", 0)
+                if "magnitude" in s and "angle_deg" in s:
+                    mag = s["magnitude"]
+                    ang = np.radians(s["angle_deg"])
+                    s["_x2"] = x1 + mag * np.cos(ang)
+                    s["_y2"] = y1 + mag * np.sin(ang)
+                else:
+                    s["_x2"] = s.get("x2", 1)
+                    s["_y2"] = s.get("y2", 0)
+                s["_mag"] = np.hypot(s["_x2"] - x1, s["_y2"] - y1)
+            resolved.append(s)
+
+        max_mag = max((s["_mag"] for s in resolved if "_mag" in s), default=1)
+
+        if spec.get("reference_circle", True) and max_mag > 0:
+            ref_circ = plt.Circle((0, 0), max_mag, fill=False,
+                                  color="lightgray", linewidth=1, linestyle="--")
+            ax.add_patch(ref_circ)
+
+        for s in resolved:
+            stype = s.get("type", "arrow")
+            color = parse_color(s.get("color", "steelblue"))
+            lw    = s.get("linewidth", 2)
+
+            if stype == "arrow":
+                x1 = s.get("x1", 0); y1 = s.get("y1", 0)
+                x2 = s["_x2"];       y2 = s["_y2"]
+                ax.annotate("",
+                    xy=(x2, y2), xytext=(x1, y1),
+                    arrowprops=dict(arrowstyle="-|>", color=color,
+                                   lw=lw, mutation_scale=14))
+                if s.get("label"):
+                    off = s.get("label_offset", 0.08)
+                    dx = x2 - x1; dy = y2 - y1
+                    lx = x2 + dx * off if dx else x2
+                    ly = y2 + dy * off if dy else y2 + off * max_mag
+                    ax.text(lx, ly, s["label"], fontsize=9, color=color,
+                            ha="left", va="center")
+
+            elif stype == "circle":
+                circ = plt.Circle(
+                    (s.get("cx", 0), s.get("cy", 0)),
+                    s.get("r", 1), fill=False, color=color, linewidth=lw)
+                ax.add_patch(circ)
+
+        ax.set_aspect("equal")
+
+        # x range: use spec value if provided, else derive from arrow data
+        if spec_has_xrange:
+            ax.set_xlim(xrange[0], xrange[1])
+        else:
+            xs = ([s.get("x1", 0) for s in resolved if s.get("type") == "arrow"] +
+                  [s.get("_x2", 0) for s in resolved if s.get("type") == "arrow"] + [0])
+            pad_x = max(abs(min(xs)), abs(max(xs)), 1) * 1.3
+            ax.set_xlim(-pad_x, pad_x)
+
+        # y range: let the general yrange block below handle it;
+        # only auto-compute when the spec omits yrange entirely
+        if not yrange:
+            ys = ([s.get("y1", 0) for s in resolved if s.get("type") == "arrow"] +
+                  [s.get("_y2", 0) for s in resolved if s.get("type") == "arrow"] + [0])
+            pad_y = max(abs(min(ys)), abs(max(ys)), 1) * 1.3
+            ax.set_ylim(-pad_y, pad_y)
+
     # ── Draw waveform presets (only when no custom curves supplied) ───────────
     if graph_type == "waveform" and not curves:
         waveform = spec.get("waveform", "sine")
@@ -281,6 +391,7 @@ def draw_graph(spec: dict) -> bytes:
 @app.post("/clip")
 async def get_clip_embedding(file: UploadFile = File(...)):
     image_bytes = await file.read()
+    model, preprocess = _get_clip()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image_tensor = preprocess(image).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -296,6 +407,7 @@ async def get_clip_embedding(file: UploadFile = File(...)):
 @app.post("/match")
 async def full_match(file: UploadFile = File(...)):
     image_bytes = await file.read()
+    model, preprocess = _get_clip()
     preprocessed = preprocess_image(image_bytes)
     ph = imagehash.phash(preprocessed, hash_size=16)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
@@ -764,3 +876,45 @@ def draw_circuit(spec: dict) -> bytes:
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
+
+@app.post("/render-diagram")
+async def render_diagram(request: Request):
+    """Accepts the full LLM JSON response and routes to the correct renderer."""
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON.")
+
+    if not payload.get("diagram_needed", True):
+        raise HTTPException(status_code=400,
+                            detail="diagram_needed is false — no diagram to render.")
+
+    diagram_type = payload.get("diagram_type")
+    if not diagram_type:
+        raise HTTPException(status_code=400,
+                            detail="diagram_type is null or missing.")
+
+    try:
+        if diagram_type == "circuit":
+            spec = payload.get("circuit_spec")
+            if not spec:
+                raise HTTPException(status_code=400,
+                                    detail="circuit_spec missing for diagram_type 'circuit'.")
+            png_bytes = draw_circuit(spec)
+        elif diagram_type in ("graph", "waveform", "geometric", "phasor"):
+            spec = payload.get("graph_spec")
+            if not spec:
+                raise HTTPException(status_code=400,
+                                    detail=f"graph_spec missing for diagram_type '{diagram_type}'.")
+            png_bytes = draw_graph(spec)
+        else:
+            raise HTTPException(status_code=400,
+                                detail=f"Unknown diagram_type: {diagram_type!r}.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Render failed: {str(e)}")
+
+    return Response(content=png_bytes, media_type="image/png")
