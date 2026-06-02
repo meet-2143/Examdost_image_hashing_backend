@@ -25,6 +25,308 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
 import io, json, re
+from copy import deepcopy
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spec normalizer — repairs LLM-generated JSON before rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _repair_json_string(raw: str) -> str:
+    """
+    Best-effort repair of malformed JSON strings from LLMs.
+    Handles:
+      - Trailing commas before } or ]
+      - Missing closing brackets/braces
+      - Markdown code fences around JSON
+    """
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.MULTILINE)
+    raw = re.sub(r"\s*```$", "", raw.strip(), flags=re.MULTILINE)
+    raw = raw.strip()
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+
+    try:
+        json.loads(raw)
+        return raw
+    except json.JSONDecodeError:
+        pass
+
+    depth_brace = 0
+    depth_bracket = 0
+    in_string = False
+    escape_next = False
+    for ch in raw:
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket -= 1
+
+    raw += "]" * max(0, depth_bracket) + "}" * max(0, depth_brace)
+    return raw
+
+
+def safe_parse(raw: str) -> dict:
+    """Parse JSON with repair fallback. Raises ValueError if unrecoverable."""
+    repaired = _repair_json_string(raw)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Cannot parse JSON even after repair: {e}")
+
+
+_GRAPH_ARRAY_FIELDS = ["curves", "points", "regions", "lines", "annotations", "shapes"]
+
+_FIELD_ALIASES = {
+    "graph_type":  "type",
+    "chart_type":  "type",
+    "plot_type":   "type",
+    "x_label":     "xlabel",
+    "y_label":     "ylabel",
+    "x_axis":      "xlabel",
+    "y_axis":      "ylabel",
+    "x_range":     "xrange",
+    "y_range":     "yrange",
+    "xlim":        "xrange",
+    "ylim":        "yrange",
+    "fig_width":   "figwidth",
+    "fig_height":  "figheight",
+    "width":       "figwidth",
+    "height":      "figheight",
+}
+
+_ANNOTATION_FIELDS = {"text", "x", "y", "tx", "ty"}
+_SHAPE_TYPES = {"circle", "polygon", "arrow", "line_segment", "point"}
+
+
+def _looks_like_annotation(obj: object) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    return bool(_ANNOTATION_FIELDS & set(obj.keys()))
+
+
+def _looks_like_shape(obj: object) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    return "type" in obj and obj.get("type") in _SHAPE_TYPES
+
+
+def _flatten_nested_lists(items: list) -> list:
+    """Flatten one level of accidental list-of-lists."""
+    result = []
+    for item in items:
+        if isinstance(item, list):
+            result.extend(item)
+        else:
+            result.append(item)
+    return result
+
+
+def normalize_graph_spec(spec: dict) -> dict:
+    """
+    Normalize an LLM-generated graph spec dict.
+
+    Fixes:
+    - Field name aliases  (x_range → xrange, fig_width → figwidth, etc.)
+    - annotations array accidentally containing shapes
+    - shapes accidentally nested inside annotations
+    - list-of-lists for any array field
+    - Missing array fields (default to [])
+    - xrange/yrange as dicts {min,max} or strings "[-10, 10]"
+    - type casing  ("Geometric" → "geometric")
+    - Arrow coordinate aliases  (start/end, from/to, origin/tip)
+    - polygon "vertices" → "points"
+    """
+    spec = deepcopy(spec)
+
+    # 1. Resolve top-level field aliases
+    for alias, canonical in _FIELD_ALIASES.items():
+        if alias in spec and canonical not in spec:
+            spec[canonical] = spec.pop(alias)
+        elif alias in spec:
+            del spec[alias]
+
+    # 2. Normalise type to lowercase
+    if "type" in spec:
+        spec["type"] = str(spec["type"]).lower()
+
+    # 3. Ensure all array fields exist
+    for field in _GRAPH_ARRAY_FIELDS:
+        if field not in spec:
+            spec[field] = []
+        elif not isinstance(spec[field], list):
+            spec[field] = [spec[field]] if spec[field] else []
+
+    # 4. Flatten list-of-lists
+    for field in _GRAPH_ARRAY_FIELDS:
+        spec[field] = _flatten_nested_lists(spec[field])
+
+    # 5. Rescue shapes that ended up inside annotations
+    rescued_shapes = []
+    clean_annotations = []
+    for item in spec["annotations"]:
+        if _looks_like_shape(item):
+            rescued_shapes.append(item)
+        elif _looks_like_annotation(item):
+            clean_annotations.append(item)
+    spec["annotations"] = clean_annotations
+
+    existing_shape_ids = {id(s) for s in spec["shapes"]}
+    for shape in rescued_shapes:
+        if id(shape) not in existing_shape_ids:
+            spec["shapes"].append(shape)
+
+    # 6. Normalise xrange / yrange
+    for range_key in ("xrange", "yrange"):
+        val = spec.get(range_key)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            nums = re.findall(r"-?\d+(?:\.\d+)?", val)
+            if len(nums) >= 2:
+                spec[range_key] = [float(nums[0]), float(nums[1])]
+            else:
+                del spec[range_key]
+        elif isinstance(val, dict):
+            lo = val.get("min", val.get("from", val.get("start")))
+            hi = val.get("max", val.get("to", val.get("end")))
+            if lo is not None and hi is not None:
+                spec[range_key] = [float(lo), float(hi)]
+            else:
+                del spec[range_key]
+        elif isinstance(val, (list, tuple)) and len(val) == 2:
+            spec[range_key] = [float(val[0]), float(val[1])]
+        else:
+            del spec[range_key]
+
+    # 7. Normalise shape arrow coordinate aliases
+    normalized_shapes = []
+    for s in spec.get("shapes", []):
+        if not isinstance(s, dict):
+            continue
+        s = dict(s)
+        if s.get("type") == "arrow":
+            if "points" in s and isinstance(s["points"], list) and len(s["points"]) == 2:
+                start_pt, end_pt = s["points"]
+                if isinstance(start_pt, (list, tuple)) and isinstance(end_pt, (list, tuple)):
+                    s.setdefault("x1", float(start_pt[0]))
+                    s.setdefault("y1", float(start_pt[1]))
+                    s.setdefault("x2", float(end_pt[0]))
+                    s.setdefault("y2", float(end_pt[1]))
+            for src_key, xk, yk in [
+                ("start",  "x1", "y1"),
+                ("end",    "x2", "y2"),
+                ("from",   "x1", "y1"),
+                ("to",     "x2", "y2"),
+                ("origin", "x1", "y1"),
+                ("tip",    "x2", "y2"),
+            ]:
+                if src_key in s:
+                    pt = s[src_key]
+                    if isinstance(pt, (list, tuple)):
+                        s.setdefault(xk, float(pt[0]))
+                        s.setdefault(yk, float(pt[1]))
+                    elif isinstance(pt, dict):
+                        s.setdefault(xk, float(pt.get("x", 0)))
+                        s.setdefault(yk, float(pt.get("y", 0)))
+        elif s.get("type") == "polygon":
+            if "vertices" in s and "points" not in s:
+                s["points"] = s["vertices"]
+        normalized_shapes.append(s)
+    spec["shapes"] = normalized_shapes
+
+    return spec
+
+
+_DIAGRAM_TYPE_ALIASES = {
+    "graph":     "graph",
+    "plot":      "graph",
+    "curve":     "graph",
+    "waveform":  "waveform",
+    "wave":      "waveform",
+    "signal":    "waveform",
+    "geometric": "geometric",
+    "geometry":  "geometric",
+    "shapes":    "geometric",
+    "phasor":    "phasor",
+    "phasors":   "phasor",
+    "circuit":   "circuit",
+    "schematic": "circuit",
+}
+
+
+def normalize_diagram_payload(payload: dict) -> dict:
+    """
+    Normalize the top-level /render-diagram payload.
+
+    Handles:
+    - diagram_type aliases
+    - graph_spec / circuit_spec embedded under unexpected keys
+    - spec fields inlined directly into payload (no nested key)
+    - diagram_needed missing (defaults to True)
+    """
+    payload = deepcopy(payload)
+
+    payload.setdefault("diagram_needed", True)
+
+    raw_type = str(payload.get("diagram_type", "")).lower().strip()
+    payload["diagram_type"] = _DIAGRAM_TYPE_ALIASES.get(raw_type, raw_type)
+
+    dtype = payload["diagram_type"]
+
+    if dtype == "circuit":
+        if "circuit_spec" not in payload:
+            for key in ("spec", "circuit", "schematic_spec", "diagram_spec"):
+                if key in payload and isinstance(payload[key], dict):
+                    payload["circuit_spec"] = payload.pop(key)
+                    break
+    else:
+        if "graph_spec" not in payload:
+            for key in ("spec", "graph", "plot_spec", "diagram_spec", "chart_spec"):
+                if key in payload and isinstance(payload[key], dict):
+                    payload["graph_spec"] = payload.pop(key)
+                    break
+
+        # Fallback: spec fields inlined directly into the payload
+        if "graph_spec" not in payload:
+            inline_keys = {"type", "shapes", "curves", "points", "lines",
+                           "regions", "annotations", "xrange", "yrange"}
+            if inline_keys & set(payload.keys()):
+                spec_keys = inline_keys | {"title", "xlabel", "ylabel",
+                                           "figwidth", "figheight",
+                                           "waveform", "frequency", "amplitude"}
+                graph_spec = {k: payload.pop(k) for k in list(payload.keys())
+                              if k in spec_keys}
+                payload["graph_spec"] = graph_spec
+
+        if "graph_spec" in payload and isinstance(payload["graph_spec"], dict):
+            gs = payload["graph_spec"]
+            if dtype in ("waveform", "geometric", "phasor"):
+                gs.setdefault("type", dtype)
+            else:
+                gs.setdefault("type", "graph")
+            payload["graph_spec"] = normalize_graph_spec(gs)
+
+    return payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Colour helper
+# ─────────────────────────────────────────────────────────────────────────────
 
 def parse_color(color):
     """Convert CSS rgba()/rgb() strings to matplotlib (r,g,b,a) tuples."""
@@ -37,11 +339,21 @@ def parse_color(color):
         return (r, g, b, a)
     return color
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image pre-processing
+# ─────────────────────────────────────────────────────────────────────────────
+
 def preprocess_image(image_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(image_bytes)).convert("L")
     img = ImageOps.exif_transpose(img)
     img = img.resize((256, 256), Image.LANCZOS)
     return img
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoints — hashing / embeddings
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.post("/phash")
 async def get_phash(file: UploadFile = File(...)):
@@ -52,21 +364,46 @@ async def get_phash(file: UploadFile = File(...)):
         "phash_hex": str(ph),
         "phash_binary": bin(int(str(ph), 16))[2:].zfill(256)
     }
-@app.post("/render-graph")
-async def render_graph(request: Request):
-    body = await request.body()
-    try:
-        spec = json.loads(body.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Body must be valid JSON.")
-    
-    try:
-        png_bytes = draw_graph(spec)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Graph render failed: {str(e)}")
-    
-    return Response(content=png_bytes, media_type="image/png")
 
+
+@app.post("/clip")
+async def get_clip_embedding(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    model, preprocess = _get_clip()
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        embedding = model.encode_image(image_tensor)
+        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+    embedding_list = embedding.cpu().numpy().flatten().tolist()
+    return {
+        "embedding": embedding_list,
+        "dims": len(embedding_list)
+    }
+
+
+@app.post("/match")
+async def full_match(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    model, preprocess = _get_clip()
+    preprocessed = preprocess_image(image_bytes)
+    ph = imagehash.phash(preprocessed, hash_size=16)
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
+    with torch.no_grad():
+        embedding = model.encode_image(image_tensor)
+        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
+    embedding_list = embedding.cpu().numpy().flatten().tolist()
+    return {
+        "phash_hex": str(ph),
+        "phash_binary": bin(int(str(ph), 16))[2:].zfill(256),
+        "clip_embedding": embedding_list
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Graph / waveform / geometric / phasor renderer
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _normalize_graph_spec(spec: dict) -> dict:
     """Absorb LLM field-name variations so renderers see canonical keys."""
@@ -75,8 +412,6 @@ def _normalize_graph_spec(spec: dict) -> dict:
     for s in spec.get("shapes", []):
         s = dict(s)
         if s.get("type") == "arrow":
-            # start/end arrays  (most common LLM variant)
-            # from/to arrays    (alternate LLM variant)
             for src_key, xk, yk in [("start", "x1", "y1"), ("end",  "x2", "y2"),
                                      ("from",  "x1", "y1"), ("to",   "x2", "y2"),
                                      ("origin","x1", "y1"), ("tip",  "x2", "y2")]:
@@ -93,44 +428,53 @@ def _normalize_graph_spec(spec: dict) -> dict:
                 s["points"] = s["vertices"]
         normalized.append(s)
     spec["shapes"] = normalized
-    # Normalise element type strings for circuit passthrough safety
     return spec
 
 
 def draw_graph(spec: dict) -> bytes:
     spec = _normalize_graph_spec(spec)
     graph_type = spec.get("type", "graph")
-    # Waveform / multi-curve plots need more horizontal room
-    default_w = 10 if graph_type == "waveform" else 7
-    figw = spec.get("figwidth", default_w)
-    figh = spec.get("figheight", 5 if graph_type == "waveform" else 4.5)
+
+    # ── Auto-size figure for geometric diagrams to avoid squished aspect ──────
+    if graph_type == "geometric" and "figwidth" not in spec and "figheight" not in spec:
+        xr = spec.get("xrange", [-10, 10])
+        yr = spec.get("yrange", None)
+        x_span = xr[1] - xr[0]
+        y_span = (yr[1] - yr[0]) if yr else x_span
+        # Scale so the longer axis = 7 inches, shorter proportional, capped 3–10
+        scale = 7.0 / max(x_span, y_span)
+        figw = max(3.0, min(10.0, x_span * scale))
+        figh = max(3.0, min(10.0, y_span * scale))
+    else:
+        default_w = 10 if graph_type == "waveform" else 7
+        figw = spec.get("figwidth", default_w)
+        figh = spec.get("figheight", 5 if graph_type == "waveform" else 4.5)
+
     fig, ax = plt.subplots(figsize=(figw, figh), dpi=120)
     fig.patch.set_facecolor('white')
     ax.set_facecolor('white')
 
-    # graph_type already read above
-    title      = spec.get("title", "")
-    xlabel     = spec.get("xlabel", "")
-    ylabel     = spec.get("ylabel", "")
+    title       = spec.get("title", "")
+    xlabel      = spec.get("xlabel", "")
+    ylabel      = spec.get("ylabel", "")
     spec_has_xrange = "xrange" in spec
-    xrange     = spec.get("xrange", [-10, 10])
-    yrange     = spec.get("yrange", None)
-    curves     = spec.get("curves", [])
-    points     = spec.get("points", [])
-    regions    = spec.get("regions", [])
-    lines      = spec.get("lines", [])
+    xrange      = spec.get("xrange", [-10, 10])
+    yrange      = spec.get("yrange", None)
+    curves      = spec.get("curves", [])
+    points      = spec.get("points", [])
+    regions     = spec.get("regions", [])
+    lines       = spec.get("lines", [])
     annotations = spec.get("annotations", [])
 
     x = np.linspace(xrange[0], xrange[1], 1000)
 
-    # ── Draw each curve ──────────────────────────────────────────────────────
+    # ── Curves ───────────────────────────────────────────────────────────────
     for curve in curves:
-        expr    = curve.get("expr", "")
-        label   = curve.get("label", "")
-        color   = curve.get("color", "blue")
-        style   = curve.get("style", "-")
+        expr  = curve.get("expr", "")
+        label = curve.get("label", "")
+        color = curve.get("color", "blue")
+        style = curve.get("style", "-")
         try:
-            # Safe eval with numpy context
             y = eval(expr, {"x": x, "np": np, "sin": np.sin,
                             "cos": np.cos, "tan": np.tan,
                             "exp": np.exp, "log": np.log,
@@ -140,7 +484,8 @@ def draw_graph(spec: dict) -> bytes:
                     label=label if label else None, linewidth=2)
         except Exception:
             continue
-    # ── Draw geometric shapes ─────────────────────────────────────────────────
+
+    # ── Geometric shapes ─────────────────────────────────────────────────────
     if graph_type == "geometric":
         shapes = spec.get("shapes", [])
         for shape in shapes:
@@ -183,19 +528,24 @@ def draw_graph(spec: dict) -> bytes:
                         "o", color=color, markersize=8)
 
             if shape.get("label"):
-                lx = shape.get("lx", shape.get("cx", shape.get("x1", 0)))
-                ly = shape.get("ly", shape.get("cy", shape.get("y1", 0)))
+                lx = shape.get("lx", shape.get("cx", shape.get("x2", shape.get("x1", 0))))
+                ly = shape.get("ly", shape.get("cy", shape.get("y2", shape.get("y1", 0))))
                 ax.text(lx, ly, shape["label"], fontsize=10,
-                        ha="center", va="bottom")
+                        ha="left", va="bottom")
 
-        ax.set_aspect("equal")
-        ax.autoscale()
+        # Respect explicit ranges; only use equal aspect when no ranges given
+        if "xrange" in spec:
+            ax.set_xlim(xrange[0], xrange[1])
+        if yrange:
+            ax.set_ylim(yrange[0], yrange[1])
+        if "xrange" not in spec and not yrange:
+            ax.set_aspect("equal")
+            ax.autoscale()
 
-    # ── Draw phasor diagram ───────────────────────────────────────────────────
+    # ── Phasor diagram ────────────────────────────────────────────────────────
     if graph_type == "phasor":
-        shapes = spec.get("shapes", [])  # already normalized by _normalize_graph_spec
+        shapes = spec.get("shapes", [])
 
-        # Resolve arrow tip coordinates once (supports polar + cartesian forms)
         resolved = []
         for s in shapes:
             s = dict(s)
@@ -248,7 +598,6 @@ def draw_graph(spec: dict) -> bytes:
 
         ax.set_aspect("equal")
 
-        # x range: use spec value if provided, else derive from arrow data
         if spec_has_xrange:
             ax.set_xlim(xrange[0], xrange[1])
         else:
@@ -257,15 +606,13 @@ def draw_graph(spec: dict) -> bytes:
             pad_x = max(abs(min(xs)), abs(max(xs)), 1) * 1.3
             ax.set_xlim(-pad_x, pad_x)
 
-        # y range: let the general yrange block below handle it;
-        # only auto-compute when the spec omits yrange entirely
         if not yrange:
             ys = ([s.get("y1", 0) for s in resolved if s.get("type") == "arrow"] +
                   [s.get("_y2", 0) for s in resolved if s.get("type") == "arrow"] + [0])
             pad_y = max(abs(min(ys)), abs(max(ys)), 1) * 1.3
             ax.set_ylim(-pad_y, pad_y)
 
-    # ── Draw waveform presets (only when no custom curves supplied) ───────────
+    # ── Waveform presets ──────────────────────────────────────────────────────
     if graph_type == "waveform" and not curves:
         waveform = spec.get("waveform", "sine")
         freq     = spec.get("frequency", 1)
@@ -284,7 +631,7 @@ def draw_graph(spec: dict) -> bytes:
         ax.plot(t, y, color="blue", linewidth=2,
                 label=spec.get("label", waveform))
 
-    # ── Draw vertical/horizontal reference lines ──────────────────────────────
+    # ── Reference lines ───────────────────────────────────────────────────────
     for line in lines:
         lcolor = line.get("color", "gray")
         lstyle = line.get("style", "--")
@@ -293,7 +640,6 @@ def draw_graph(spec: dict) -> bytes:
             xv = line.get("value", 0)
             ax.axvline(x=xv, color=lcolor, linestyle=lstyle, linewidth=1)
             if llabel:
-                # Use blended transform: x in data coords, y in axes fraction
                 import matplotlib.transforms as mtransforms
                 trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
                 ax.text(xv, 0.97, llabel, transform=trans,
@@ -309,13 +655,12 @@ def draw_graph(spec: dict) -> bytes:
                         ha="right", va="bottom",
                         fontsize=8, color=lcolor)
 
-    # ── Draw shaded regions ───────────────────────────────────────────────────
+    # ── Shaded regions ────────────────────────────────────────────────────────
     _eval_ns = {"np": np, "sin": np.sin, "cos": np.cos, "tan": np.tan,
                 "exp": np.exp, "log": np.log, "sqrt": np.sqrt,
                 "pi": np.pi, "abs": np.abs, "e": np.e}
     for region in regions:
         raw_color = parse_color(region.get("color", "yellow"))
-        # If color already encodes alpha (tuple with 4 elements), don't double-apply alpha
         if isinstance(raw_color, tuple) and len(raw_color) == 4:
             fill_color = raw_color[:3]
             fill_alpha = raw_color[3]
@@ -325,7 +670,6 @@ def draw_graph(spec: dict) -> bytes:
         rlabel = region.get("label", "")
 
         if "x1_expr" in region or "x2_expr" in region:
-            # Shade between two x=f(y) curves over a y range
             yr = yrange if yrange else [xrange[0], xrange[1]]
             y1_val = region.get("y1", yr[0])
             y2_val = region.get("y2", yr[1])
@@ -345,7 +689,7 @@ def draw_graph(spec: dict) -> bytes:
             ax.axvspan(x1, x2, alpha=fill_alpha, color=fill_color,
                        label=rlabel if rlabel else None)
 
-    # ── Draw points ───────────────────────────────────────────────────────────
+    # ── Points ────────────────────────────────────────────────────────────────
     for pt in points:
         ax.plot(pt["x"], pt["y"],
                 marker=pt.get("marker", "o"),
@@ -357,7 +701,7 @@ def draw_graph(spec: dict) -> bytes:
                         xytext=(pt["x"] + 0.3, pt["y"] + 0.3),
                         fontsize=10)
 
-    # ── Annotations (arrows with text) ────────────────────────────────────────
+    # ── Text annotations ──────────────────────────────────────────────────────
     for ann in annotations:
         ax.annotate(ann.get("text", ""),
                     xy=(ann["x"], ann["y"]),
@@ -388,61 +732,45 @@ def draw_graph(spec: dict) -> bytes:
     return buf.read()
 
 
-@app.post("/clip")
-async def get_clip_embedding(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    model, preprocess = _get_clip()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image_tensor = preprocess(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        embedding = model.encode_image(image_tensor)
-        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-    embedding_list = embedding.cpu().numpy().flatten().tolist()
-    return {
-        "embedding": embedding_list,
-        "dims": len(embedding_list)
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# Endpoints — graph rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.post("/render-graph")
+async def render_graph(request: Request):
+    body = await request.body()
+    try:
+        spec = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON.")
+
+    spec = normalize_graph_spec(spec)  # ← repair LLM inconsistencies
+
+    try:
+        png_bytes = draw_graph(spec)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Graph render failed: {str(e)}")
+
+    return Response(content=png_bytes, media_type="image/png")
 
 
-@app.post("/match")
-async def full_match(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    model, preprocess = _get_clip()
-    preprocessed = preprocess_image(image_bytes)
-    ph = imagehash.phash(preprocessed, hash_size=16)
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image_tensor = preprocess(image).unsqueeze(0).to(device)
-    with torch.no_grad():
-        embedding = model.encode_image(image_tensor)
-        embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-    embedding_list = embedding.cpu().numpy().flatten().tolist()
-    return {
-        "phash_hex": str(ph),
-        "phash_binary": bin(int(str(ph), 16))[2:].zfill(256),
-        "clip_embedding": embedding_list
-    }
-
+# ─────────────────────────────────────────────────────────────────────────────
+# SVG → PNG helper
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _svg_to_png(svg_string: str, width: int = 800) -> bytes:
-    """Convert SVG string to PNG bytes.
-
-    Tries cairosvg first (best quality, needs native Cairo library).
-    Falls back to svglib → renderPDF → PyMuPDF which is fully pure-Python
-    and works on Windows without any system library installation.
-    """
-    # ── Attempt 1: cairosvg (Linux/Mac/Windows-with-GTK) ──────────────────
+    """Convert SVG string to PNG bytes via cairosvg or svglib fallback."""
     try:
         import cairosvg
         return cairosvg.svg2png(bytestring=svg_string.encode(), output_width=width)
     except (ImportError, OSError):
-        pass  # Cairo C library not present on this host
+        pass
 
-    # ── Attempt 2: svglib → renderPDF → PyMuPDF (no Cairo needed) ─────────
     try:
         import tempfile, os
         from svglib.svglib import svg2rlg
         from reportlab.graphics import renderPDF
-        import fitz  # PyMuPDF
+        import fitz
 
         with tempfile.NamedTemporaryFile(suffix=".svg", delete=False,
                                          mode="w", encoding="utf-8") as f:
@@ -452,14 +780,10 @@ def _svg_to_png(svg_string: str, width: int = 800) -> bytes:
             drawing = svg2rlg(tmp_path)
             if drawing is None:
                 raise ValueError("svglib could not parse the SVG document.")
-
-            # Render drawing to PDF bytes (pure Python, no Cairo)
             pdf_buf = io.BytesIO()
             renderPDF.drawToFile(drawing, pdf_buf)
             pdf_buf.seek(0)
             pdf_bytes = pdf_buf.read()
-
-            # Convert first PDF page → PNG at requested width via PyMuPDF
             doc  = fitz.open(stream=pdf_bytes, filetype="pdf")
             page = doc[0]
             zoom = (width / page.rect.width) if page.rect.width else 1.0
@@ -492,22 +816,13 @@ async def render_svg(request: Request):
 
     return Response(content=png_bytes, media_type="image/png")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Circuit renderer
+# ─────────────────────────────────────────────────────────────────────────────
+
 import schemdraw
 import schemdraw.elements as elm
-
-@app.post("/render-circuit")
-async def render_circuit(request: Request):
-    body = await request.body()
-    try:
-        spec = json.loads(body.decode("utf-8"))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Body must be valid JSON.")
-    try:
-        png_bytes = draw_circuit(spec)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Circuit render failed: {str(e)}")
-    return Response(content=png_bytes, media_type="image/png")
-
 
 ELEMENT_MAP = {
     # ── Passives ──────────────────────────────────────────────────────────────
@@ -686,20 +1001,18 @@ DIRECTION_MAP = {
     "down":  "down",  "d": "down",
 }
 
-# Element pins to auto-expose as named anchors (name.pin)
 _ELEMENT_PINS = [
     "start", "end", "center",
-    "base", "collector", "emitter",          # BJT
-    "gate", "drain", "source",               # FET
-    "in1", "in2", "out", "vs", "vd",         # Opamp
-    "p1", "p2", "s1", "s2",                  # Transformer
-    "tap",                                   # Potentiometer
-    "absw",                                  # SwitchSpdt
+    "base", "collector", "emitter",
+    "gate", "drain", "source",
+    "in1", "in2", "out", "vs", "vd",
+    "p1", "p2", "s1", "s2",
+    "tap",
+    "absw",
 ]
 
 
 def _resolve_at(kwargs: dict, at, anchors: dict):
-    """Resolve `at` string/list into an anchor coordinate and add to kwargs."""
     if at is None:
         return
     if isinstance(at, (list, tuple)):
@@ -709,7 +1022,6 @@ def _resolve_at(kwargs: dict, at, anchors: dict):
 
 
 def _save_anchors(anchors: dict, name: str, el):
-    """Store element end and all named pins under `name` and `name.pin`."""
     anchors[name] = el.end
     for pin in _ELEMENT_PINS:
         val = getattr(el, pin, None)
@@ -739,31 +1051,26 @@ def draw_circuit(spec: dict) -> bytes:
             direction = DIRECTION_MAP.get(el_spec.get("direction", "right"), "right")
             name      = el_spec.get("name", None)
 
-            # ── Label(s) config ─────────────────────────────────────────────
             label     = el_spec.get("label", "")
             label_loc = el_spec.get("label_loc", None)
-            labels    = el_spec.get("labels", [])  # [{text, loc, color, fontsize}]
+            labels    = el_spec.get("labels", [])
 
-            # ── Geometry / placement ────────────────────────────────────────
             length    = el_spec.get("length", None)
-            at        = el_spec.get("at", None)      # anchor name, "name.pin", or [x,y]
-            tox       = el_spec.get("tox", None)     # extend line to x coord / anchor
-            toy       = el_spec.get("toy", None)     # extend line to y coord / anchor
+            at        = el_spec.get("at", None)
+            tox       = el_spec.get("tox", None)
+            toy       = el_spec.get("toy", None)
 
-            # ── Style ───────────────────────────────────────────────────────
             flip      = el_spec.get("flip", False)
             reverse   = el_spec.get("reverse", False)
             color     = el_spec.get("color", None)
             linewidth = el_spec.get("linewidth", None)
             fill      = el_spec.get("fill", None)
-            dot       = el_spec.get("dot", False)    # junction dot at end
-            idot      = el_spec.get("idot", False)   # junction dot at start
+            dot       = el_spec.get("dot", False)
+            idot      = el_spec.get("idot", False)
             zorder    = el_spec.get("zorder", None)
 
-            # ── Pass-through kwargs for element-specific options ─────────────
             extra     = el_spec.get("kwargs", {})
 
-            # ── Invisible reposition (move/jump) ────────────────────────────
             if el_type in ("move", "jump"):
                 kw = {"d": direction}
                 if length:
@@ -772,15 +1079,14 @@ def draw_circuit(spec: dict) -> bytes:
                 el = d.add(elm.Line(**kw).color("white").linewidth(0))
                 if name:
                     _save_anchors(anchors, name, el)
-                anchors["_prev_end"]    = el.end
-                anchors["_prev_start"]  = el.start
+                anchors["_prev_end"]   = el.end
+                anchors["_prev_start"] = el.start
                 continue
 
             ElClass = ELEMENT_MAP.get(el_type)
             if ElClass is None:
                 continue
 
-            # ── Build constructor kwargs ────────────────────────────────────
             kw = {"d": direction, **extra}
             if length:
                 kw["l"] = length
@@ -792,7 +1098,6 @@ def draw_circuit(spec: dict) -> bytes:
 
             element = ElClass(**kw)
 
-            # ── Method-chain extensions ─────────────────────────────────────
             if tox is not None:
                 tx = anchors[tox] if isinstance(tox, str) and tox in anchors else tox
                 element = element.tox(tx)
@@ -812,15 +1117,14 @@ def draw_circuit(spec: dict) -> bytes:
             if zorder is not None:
                 element = element.zorder(zorder)
 
-            # ── Apply labels ────────────────────────────────────────────────
             if label:
                 if label_loc:
                     loc = label_loc
                 elif direction in ("right", "left"):
                     loc = "top"
                 elif direction == "up":
-                    loc = "right"   # keep label inside circuit, not pushed outside/below
-                else:               # down
+                    loc = "right"
+                else:
                     loc = "right"
                 element = element.label(label, loc=loc)
             for lbl in labels:
@@ -845,7 +1149,6 @@ def draw_circuit(spec: dict) -> bytes:
             if hasattr(el, "center"):
                 anchors["_prev_center"] = el.center
 
-    # ── Circuit annotations (text notes pinned to named anchors) ─────────────
     for ann in spec.get("annotations", []):
         note    = ann.get("note", "")
         at_node = ann.get("at_node", None)
@@ -878,6 +1181,24 @@ def draw_circuit(spec: dict) -> bytes:
     return buf.read()
 
 
+@app.post("/render-circuit")
+async def render_circuit(request: Request):
+    body = await request.body()
+    try:
+        spec = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON.")
+    try:
+        png_bytes = draw_circuit(spec)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Circuit render failed: {str(e)}")
+    return Response(content=png_bytes, media_type="image/png")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified /render-diagram endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.post("/render-diagram")
 async def render_diagram(request: Request):
     """Accepts the full LLM JSON response and routes to the correct renderer."""
@@ -886,6 +1207,8 @@ async def render_diagram(request: Request):
         payload = json.loads(body.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Body must be valid JSON.")
+
+    payload = normalize_diagram_payload(payload)  # ← repair LLM inconsistencies
 
     if not payload.get("diagram_needed", True):
         raise HTTPException(status_code=400,
