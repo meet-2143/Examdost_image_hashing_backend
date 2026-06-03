@@ -703,17 +703,14 @@ def draw_graph(spec: dict) -> bytes:
 
     # ── Text annotations ──────────────────────────────────────────────────────
     for ann in annotations:
-        tx = ann.get("tx")
-        ty = ann.get("ty")
-        if tx is None:
-            tx = ann["x"] + 1
-        if ty is None:
-            ty = ann["y"] + 1
+        tx = ann.get("tx") if ann.get("tx") is not None else ann["x"] + 1
+        ty = ann.get("ty") if ann.get("ty") is not None else ann["y"] + 1
         ax.annotate(ann.get("text", ""),
                     xy=(ann["x"], ann["y"]),
                     xytext=(tx, ty),
                     arrowprops=dict(arrowstyle="->", color="black"),
                     fontsize=10)
+
 
     # ── Axes and grid ─────────────────────────────────────────────────────────
     ax.axhline(0, color="black", linewidth=0.8)
