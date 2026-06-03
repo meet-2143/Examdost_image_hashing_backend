@@ -1022,7 +1022,12 @@ def _resolve_at(kwargs: dict, at, anchors: dict):
 
 
 def _save_anchors(anchors: dict, name: str, el):
-    anchors[name] = el.end
+    if hasattr(el, 'end'):
+        anchors[name] = el.end
+    elif hasattr(el, 'center'):
+        anchors[name] = el.center
+    elif hasattr(el, 'start'):
+        anchors[name] = el.start
     for pin in _ELEMENT_PINS:
         val = getattr(el, pin, None)
         if val is not None:
@@ -1079,8 +1084,10 @@ def draw_circuit(spec: dict) -> bytes:
                 el = d.add(elm.Line(**kw).color("white").linewidth(0))
                 if name:
                     _save_anchors(anchors, name, el)
-                anchors["_prev_end"]   = el.end
-                anchors["_prev_start"] = el.start
+                if hasattr(el, 'end'):
+                    anchors["_prev_end"] = el.end
+                if hasattr(el, 'start'):
+                    anchors["_prev_start"] = el.start
                 continue
 
             ElClass = ELEMENT_MAP.get(el_type)
@@ -1144,8 +1151,10 @@ def draw_circuit(spec: dict) -> bytes:
 
             if name:
                 _save_anchors(anchors, name, el)
-            anchors["_prev_start"] = el.start
-            anchors["_prev_end"]   = el.end
+            if hasattr(el, 'end'):
+                anchors["_prev_end"] = el.end
+            if hasattr(el, 'start'):
+                anchors["_prev_start"] = el.start
             if hasattr(el, "center"):
                 anchors["_prev_center"] = el.center
 
