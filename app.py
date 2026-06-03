@@ -703,10 +703,15 @@ def draw_graph(spec: dict) -> bytes:
 
     # ── Text annotations ──────────────────────────────────────────────────────
     for ann in annotations:
+        tx = ann.get("tx")
+        ty = ann.get("ty")
+        if tx is None:
+            tx = ann["x"] + 1
+        if ty is None:
+            ty = ann["y"] + 1
         ax.annotate(ann.get("text", ""),
                     xy=(ann["x"], ann["y"]),
-                    xytext=(ann.get("tx", ann["x"] + 1),
-                            ann.get("ty", ann["y"] + 1)),
+                    xytext=(tx, ty),
                     arrowprops=dict(arrowstyle="->", color="black"),
                     fontsize=10)
 
