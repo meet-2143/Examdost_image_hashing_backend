@@ -190,6 +190,7 @@ def normalize_graph_spec(spec: dict) -> dict:
             spec["shapes"].append(shape)
 
     # 6. Normalise xrange / yrange
+    
     for range_key in ("xrange", "yrange"):
         val = spec.get(range_key)
         if val is None:
@@ -704,11 +705,14 @@ def draw_graph(spec: dict) -> bytes:
     for ann in annotations:
         if "x" not in ann or "y" not in ann:
             continue
-        ax.annotate(ann.get("text", ""),
-                    xy=(ann["x"], ann["y"]),
-                    xytext=(tx, ty),
-                    arrowprops=dict(arrowstyle="->", color="black"),
-                    fontsize=10)
+        ann_x, ann_y = ann["x"], ann["y"]
+        ann_tx = ann.get("tx", ann_x)
+        ann_ty = ann.get("ty", ann_y)
+        kw = {"fontsize": ann.get("fontsize", 10)}
+        if ann_tx != ann_x or ann_ty != ann_y:
+            kw["xytext"] = (ann_tx, ann_ty)
+            kw["arrowprops"] = dict(arrowstyle="->", color="black")
+        ax.annotate(ann.get("text", ""), xy=(ann_x, ann_y), **kw)
 
 
     # ── Axes and grid ─────────────────────────────────────────────────────────
