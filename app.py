@@ -139,7 +139,6 @@ def _flatten_nested_lists(items: list) -> list:
 def normalize_graph_spec(spec: dict) -> dict:
     """
     Normalize an LLM-generated graph spec dict.
-
     Fixes:
     - Field name aliases  (x_range → xrange, fig_width → figwidth, etc.)
     - annotations array accidentally containing shapes
