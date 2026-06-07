@@ -359,6 +359,8 @@ def draw_graph(spec: dict) -> bytes:
 
     # ── Annotations (arrows with text) ────────────────────────────────────────
     for ann in annotations:
+        if "x" not in ann or "y" not in ann:
+            continue
         ax.annotate(ann.get("text", ""),
                     xy=(ann["x"], ann["y"]),
                     xytext=(ann.get("tx", ann["x"] + 1),
@@ -689,32 +691,90 @@ DIRECTION_MAP = {
 # Element pins to auto-expose as named anchors (name.pin)
 _ELEMENT_PINS = [
     "start", "end", "center",
-    "base", "collector", "emitter",          # BJT
-    "gate", "drain", "source",               # FET
-    "in1", "in2", "out", "vs", "vd",         # Opamp
-    "p1", "p2", "s1", "s2",                  # Transformer
-    "tap",                                   # Potentiometer
-    "absw",                                  # SwitchSpdt
+    "base", "collector", "emitter",
+    "gate", "drain", "source",
+    "in1", "in2", "out", "vs", "vd",
+    "p1", "p2", "s1", "s2",
+    "tap",
+    "absw",
 ]
+
+# Compound suffixes the LLM commonly references that we resolve manually
+_ANCHOR_SUFFIXES = ["start", "end", "center", "gate", "base",
+                    "collector", "emitter", "drain", "source",
+                    "in1", "in2", "out"]
+
 
 
 def _resolve_at(kwargs: dict, at, anchors: dict):
-    """Resolve `at` string/list into an anchor coordinate and add to kwargs."""
     if at is None:
         return
     if isinstance(at, (list, tuple)):
         kwargs["at"] = at
-    elif isinstance(at, str) and at in anchors:
+        return
+    if not isinstance(at, str):
+        return
+
+    # Direct match
+    if at in anchors:
         kwargs["at"] = anchors[at]
+        return
+
+    # Compound key fallback: "src.start" → try "src" if "src.start" missing
+    if "." in at:
+        base, suffix = at.rsplit(".", 1)
+        if at not in anchors and base in anchors:
+            base_pt = anchors[base]
+            # For .start: the bare name saves .end, so we can't derive
+            # .start from it — but we may have saved it as _cursor_before
+            # on the element's name. Try the synthesised key first.
+            synth_key = f"_before_{base}"
+            if suffix == "start" and synth_key in anchors:
+                kwargs["at"] = anchors[synth_key]
+            elif suffix == "end":
+                # bare name IS the end
+                kwargs["at"] = base_pt
+            elif suffix == "center" and f"{base}.center" not in anchors:
+                kwargs["at"] = base_pt
+            else:
+                # Best available fallback: use the bare anchor
+                kwargs["at"] = base_pt
+            return
+
+    # Unknown anchor — log and skip rather than crashing
+    import warnings
+    warnings.warn(f"Anchor '{at}' not found in anchors dict. Skipping 'at'.")
 
 
 def _save_anchors(anchors: dict, name: str, el):
-    """Store element end and all named pins under `name` and `name.pin`."""
-    anchors[name] = el.end
-    for pin in _ELEMENT_PINS:
+    # Always save bare name → end (most useful cursor position)
+    if hasattr(el, 'end'):
+        anchors[name] = el.end
+    elif hasattr(el, 'center'):
+        anchors[name] = el.center
+    elif hasattr(el, 'start'):
+        anchors[name] = el.start
+
+    # Save every real schemdraw pin as name.pin
+    for pin in _ANCHOR_SUFFIXES:
         val = getattr(el, pin, None)
         if val is not None:
             anchors[f"{name}.{pin}"] = val
+
+    # CRITICAL: always save .start and .end explicitly even if
+    # schemdraw doesn't expose them as named pins — derive from
+    # BoundingBox or the drawing position stored on the element.
+    if hasattr(el, 'start') and f"{name}.start" not in anchors:
+        anchors[f"{name}.start"] = el.start
+    if hasattr(el, 'end') and f"{name}.end" not in anchors:
+        anchors[f"{name}.end"] = el.end
+
+    # Fallback: if element has no .start but has .end, synthesise
+    # .start as the cursor position BEFORE the element was added.
+    # We store _prev_end before each element for exactly this purpose.
+    if f"{name}.start" not in anchors and "_cursor_before" in anchors:
+        anchors[f"{name}.start"] = anchors["_cursor_before"]
+
 
 
 def draw_circuit(spec: dict) -> bytes:
@@ -738,6 +798,11 @@ def draw_circuit(spec: dict) -> bytes:
             el_type   = el_spec.get("type", "line").lower()
             direction = DIRECTION_MAP.get(el_spec.get("direction", "right"), "right")
             name      = el_spec.get("name", None)
+
+            # Snapshot cursor before this element so we can synthesise
+            # .start anchors for elements that don't expose one directly.
+            if hasattr(d, 'here'):
+                anchors["_cursor_before"] = d.here
 
             # ── Label(s) config ─────────────────────────────────────────────
             label     = el_spec.get("label", "")
@@ -780,6 +845,10 @@ def draw_circuit(spec: dict) -> bytes:
             if ElClass is None:
                 continue
 
+            # Save a named before-snapshot so compound ".start" refs work
+            if name and hasattr(d, 'here'):
+                anchors[f"_before_{name}"] = d.here
+
             # ── Build constructor kwargs ────────────────────────────────────
             kw = {"d": direction, **extra}
             if length:
@@ -794,11 +863,63 @@ def draw_circuit(spec: dict) -> bytes:
 
             # ── Method-chain extensions ─────────────────────────────────────
             if tox is not None:
-                tx = anchors[tox] if isinstance(tox, str) and tox in anchors else tox
-                element = element.tox(tx)
+                if isinstance(tox, str):
+                    if tox in anchors:
+                        tx = anchors[tox]
+                    elif "." in tox:
+                        # Compound fallback: "src.start" → try "_before_src", then "src"
+                        base, suffix = tox.rsplit(".", 1)
+                        synth = f"_before_{base}"
+                        if suffix == "start" and synth in anchors:
+                            tx = anchors[synth]
+                        elif base in anchors:
+                            tx = anchors[base]
+                        else:
+                            import warnings
+                            warnings.warn(f"tox anchor '{tox}' not resolved; skipping.")
+                            tx = None
+                    else:
+                        import warnings
+                        warnings.warn(f"tox anchor '{tox}' not found; skipping.")
+                        tx = None
+                else:
+                    tx = tox
+                if tx is not None:
+                    # Always pass a numeric x-coordinate to schemdraw, not a Point/string
+                    if hasattr(tx, 'x'):
+                        tx = float(tx.x)
+                    elif isinstance(tx, (list, tuple)) and not isinstance(tx, str):
+                        tx = float(tx[0])
+                    element = element.tox(tx)
+
             if toy is not None:
-                ty = anchors[toy] if isinstance(toy, str) and toy in anchors else toy
-                element = element.toy(ty)
+                if isinstance(toy, str):
+                    if toy in anchors:
+                        ty = anchors[toy]
+                    elif "." in toy:
+                        base, suffix = toy.rsplit(".", 1)
+                        synth = f"_before_{base}"
+                        if suffix == "start" and synth in anchors:
+                            ty = anchors[synth]
+                        elif base in anchors:
+                            ty = anchors[base]
+                        else:
+                            import warnings
+                            warnings.warn(f"toy anchor '{toy}' not resolved; skipping.")
+                            ty = None
+                    else:
+                        import warnings
+                        warnings.warn(f"toy anchor '{toy}' not found; skipping.")
+                        ty = None
+                else:
+                    ty = toy
+                if ty is not None:
+                    # Always pass a numeric y-coordinate to schemdraw, not a Point/string
+                    if hasattr(ty, 'y'):
+                        ty = float(ty.y)
+                    elif isinstance(ty, (list, tuple)) and not isinstance(ty, str):
+                        ty = float(ty[1])
+                    element = element.toy(ty)
             if color:
                 element = element.color(color)
             if linewidth is not None:
