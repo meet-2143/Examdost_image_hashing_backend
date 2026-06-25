@@ -6,6 +6,7 @@ import clip
 import torch
 import io
 
+import schemdraw.elements.logic as logic_elm
 
 app = FastAPI()
 
@@ -830,6 +831,14 @@ import schemdraw
 import schemdraw.elements as elm
 
 ELEMENT_MAP = {
+    "xor":     logic_elm.Xor,
+    "xnor":    logic_elm.Xnor,
+    "and":     logic_elm.And,
+    "nand":    logic_elm.Nand,
+    "or":      logic_elm.Or,
+    "nor":     logic_elm.Nor,
+    "not":     logic_elm.Not,
+    "buf":     logic_elm.Buf,
     # ── Passives ──────────────────────────────────────────────────────────────
     "resistor":              elm.Resistor,
     "resistor_iec":          elm.ResistorIEC,
@@ -1031,7 +1040,10 @@ def _resolve_at(kwargs: dict, at, anchors: dict):
         return
     if not isinstance(at, str):
         return
-
+    coord_match = re.match(r'^[\(\[]\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*[\)\]]$', at.strip())
+    if coord_match:
+        kwargs["at"] = (float(coord_match.group(1)), float(coord_match.group(2)))
+        return
     # Direct match
     if at in anchors:
         kwargs["at"] = anchors[at]
@@ -1092,13 +1104,18 @@ def _save_anchors(anchors: dict, name: str, el):
     if f"{name}.start" not in anchors and "_cursor_before" in anchors:
         anchors[f"{name}.start"] = anchors["_cursor_before"]
 
-
-
-def draw_circuit(spec: dict) -> bytes:
-    title    = spec.get("title", "")
-    elements = spec.get("elements", [])
-    figw     = spec.get("figwidth", 14)
-    figh     = spec.get("figheight", 6)
+    def draw_circuit(spec: dict) -> bytes:
+        title    = spec.get("title", "")
+        elements = spec.get("elements", [])
+        def _safe_dim(val, default, lo=2.0, hi=30.0):
+        try:
+            v = float(val)
+            return v if lo <= v <= hi else default
+        except (TypeError, ValueError):
+            return default
+    
+    figw = _safe_dim(spec.get("figwidth"), 14)
+    figh = _safe_dim(spec.get("figheight"), 6)
     fontsize = spec.get("fontsize", 11)
     unit     = spec.get("unit", 3.0)
 
