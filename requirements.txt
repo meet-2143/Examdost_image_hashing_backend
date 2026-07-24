@@ -13,3 +13,5 @@ svglib
 reportlab
 pymupdf
 schemdraw
+matplotlib
+
