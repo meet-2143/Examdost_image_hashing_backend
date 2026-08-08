@@ -44,7 +44,11 @@ client = TelegramClient("session", api_id, api_hash)
 
 @app.on_event("startup")
 async def startup():
-    await client.start()
+    try:
+        await client.start()
+    except EOFError:
+        print("Warning: Telegram client has no valid session and no TTY to authenticate "
+              "interactively — /members will not work until session.session is set up on this host.")
 
 
 _LATEX_TEMPLATE = r"""\documentclass[11pt]{article}
