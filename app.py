@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import Response
 from PIL import Image, ImageOps
@@ -17,6 +20,13 @@ def _get_clip():
     if _clip_model is None:
         _clip_model, _clip_preprocess = clip.load("ViT-B/32", device=device)
     return _clip_model, _clip_preprocess
+import pypandoc
+import subprocess
+import tempfile
+import os
+import shutil
+
+import requests
 
 import matplotlib
 matplotlib.use('Agg')
@@ -36,6 +46,156 @@ client = TelegramClient("session", api_id, api_hash)
 async def startup():
     await client.start()
 
+
+_LATEX_TEMPLATE = r"""\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{mathpazo}
+\usepackage{amsmath,amssymb}
+\usepackage[hidelinks]{hyperref}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{titlesec}
+\titleformat{\section}{\large\bfseries}{\thesection}{1em}{}
+\setlength{\parskip}{0.6em}
+\begin{document}
+%s
+\end{document}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fixed brand asset (Examdost logo) — baked into the service, not per-request
+# ─────────────────────────────────────────────────────────────────────────────
+LOGO_SOURCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "examdost_logo.png")
+
+
+def _ensure_logo_present(tmpdir: str):
+    """Copy the fixed Examdost logo into the compile directory, if it exists on disk."""
+    if os.path.exists(LOGO_SOURCE_PATH):
+        try:
+            shutil.copy(LOGO_SOURCE_PATH, os.path.join(tmpdir, "examdost_logo.png"))
+        except Exception as e:
+            # Never let a logo-copy failure block the whole compile
+            print(f"Warning: failed to copy logo asset: {e}")
+
+
+def _read_log_tail(tmpdir: str, lines: int = 40) -> str:
+    """Read the last N lines of document.log for debugging failed/timed-out compiles."""
+    log_path = os.path.join(tmpdir, "document.log")
+    if not os.path.exists(log_path):
+        return "(no .log file produced)"
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.readlines()
+        return "".join(content[-lines:])
+    except Exception as e:
+        return f"(failed to read log: {e})"
+
+
+def _sanitize_latex(latex_source: str) -> str:
+    """Fix known pandoc-template quirks that break pdflatex."""
+    # Collapse \documentclass[ <blank/whitespace> ]{...} onto one line
+    latex_source = re.sub(
+        r'\\documentclass\[\s*\n\s*\]',
+        r'\\documentclass[]',
+        latex_source
+    )
+    return latex_source
+
+
+def _ensure_full_document(latex_source: str) -> str:
+    """Wrap bare LaTeX fragments in a styled document shell if needed."""
+    if "\\documentclass" in latex_source:
+        return latex_source
+    return _LATEX_TEMPLATE % latex_source
+
+
+
+@app.post("/html-to-latex")
+async def html_to_latex(request: Request):
+    body = await request.body()
+    html_string = body.decode("utf-8").strip()
+
+    if not html_string:
+        raise HTTPException(status_code=400,
+                            detail="Empty request body — send raw HTML string.")
+
+    try:
+        latex_output = pypandoc.convert_text(
+            html_string,
+            to="latex",
+            format="html",
+            extra_args=["--standalone", "--wrap=preserve"]
+        )
+        latex_output = _sanitize_latex(latex_output)
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"HTML→LaTeX conversion failed: {str(e)}")
+
+    return Response(content=latex_output, media_type="text/x-tex")
+
+
+import base64
+LATEX_COMPILE_API_URL = "https://latex.ytotech.com/builds/sync"
+
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "examdost_logo.png")
+
+def compile_latex_to_pdf(latex_source: str) -> bytes:
+    full_source = _ensure_full_document(latex_source)
+    full_source = _sanitize_latex(full_source)
+
+    resources = [{"main": True, "content": full_source}]
+
+    if os.path.exists(LOGO_PATH):
+        with open(LOGO_PATH, "rb") as f:
+            logo_b64 = base64.b64encode(f.read()).decode("ascii")
+        resources.append({
+            "path": "examdost_logo.png",
+            "file": logo_b64,
+        })
+
+    payload = {
+        "compiler": "pdflatex",
+        "resources": resources,
+    }
+
+    try:
+        response = requests.post(LATEX_COMPILE_API_URL, json=payload, timeout=60)
+    except requests.exceptions.Timeout:
+        raise RuntimeError("Remote LaTeX compile timed out after 60s.")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"Could not reach LaTeX compile API: {e}")
+
+    if response.status_code != 201:
+        raise RuntimeError(f"Remote compile failed (status {response.status_code}):\n{response.text[:2000]}")
+
+    content_type = response.headers.get("content-type", "")
+    if "pdf" not in content_type.lower():
+        raise RuntimeError(f"Expected PDF, got '{content_type}'. Body: {response.text[:500]}")
+
+    return response.content
+
+
+
+@app.post("/latex-to-pdf")
+async def latex_to_pdf(request: Request):
+    body = await request.body()
+    latex_string = body.decode("utf-8").strip()
+
+    if not latex_string:
+        raise HTTPException(status_code=400,
+                            detail="Empty request body — send raw LaTeX string.")
+
+    try:
+        pdf_bytes = compile_latex_to_pdf(latex_string)
+    except Exception as e:
+        raise HTTPException(status_code=500,
+                            detail=f"LaTeX→PDF compilation failed: {str(e)}")
+
+    return Response(content=pdf_bytes, media_type="application/pdf")
+
+
+
 @app.get("/members")
 async def members():
     group = await client.get_entity(-1003990692345)
@@ -49,6 +209,88 @@ async def members():
         }
         for p in participants
     ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram photo merge — fetch two photos by Bot API file_id, merge horizontally
+# ─────────────────────────────────────────────────────────────────────────────
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_BASE = "https://api.telegram.org"
+
+
+def _download_telegram_photo(file_id: str) -> bytes:
+    """Resolve a Bot API file_id to its CDN path, then download the raw bytes."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set.")
+
+    get_file_url = f"{TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/getFile"
+    resp = requests.get(get_file_url, params={"file_id": file_id}, timeout=30)
+    if resp.status_code != 200:
+        raise RuntimeError(f"getFile failed for {file_id} (status {resp.status_code}): {resp.text[:500]}")
+
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"getFile returned not-ok for {file_id}: {data}")
+
+    file_path = data["result"]["file_path"]
+    download_url = f"{TELEGRAM_API_BASE}/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    file_resp = requests.get(download_url, timeout=30)
+    if file_resp.status_code != 200:
+        raise RuntimeError(f"File download failed for {file_id} (status {file_resp.status_code})")
+
+    return file_resp.content
+
+
+def _merge_images_horizontally(image_bytes_1: bytes, image_bytes_2: bytes) -> bytes:
+    """Scale both images to a common height, then paste them side by side."""
+    img1 = Image.open(io.BytesIO(image_bytes_1)).convert("RGB")
+    img2 = Image.open(io.BytesIO(image_bytes_2)).convert("RGB")
+
+    target_height = min(img1.height, img2.height)
+
+    def _resize_to_height(img: Image.Image, height: int) -> Image.Image:
+        if img.height == height:
+            return img
+        width = round(img.width * (height / img.height))
+        return img.resize((width, height), Image.LANCZOS)
+
+    img1 = _resize_to_height(img1, target_height)
+    img2 = _resize_to_height(img2, target_height)
+
+    merged = Image.new("RGB", (img1.width + img2.width, target_height), "white")
+    merged.paste(img1, (0, 0))
+    merged.paste(img2, (img1.width, 0))
+
+    buf = io.BytesIO()
+    merged.save(buf, format="PNG")
+    buf.seek(0)
+    return buf.read()
+
+
+@app.post("/merge-telegram-photos")
+async def merge_telegram_photos(request: Request):
+    body = await request.body()
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON.")
+
+    file_id_1 = payload.get("file_id_1")
+    file_id_2 = payload.get("file_id_2")
+    if not file_id_1 or not file_id_2:
+        raise HTTPException(status_code=400,
+                            detail="Both 'file_id_1' and 'file_id_2' are required.")
+
+    try:
+        image_bytes_1 = _download_telegram_photo(file_id_1)
+        image_bytes_2 = _download_telegram_photo(file_id_2)
+        merged_bytes = _merge_images_horizontally(image_bytes_1, image_bytes_2)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Photo merge failed: {str(e)}")
+
+    return Response(content=merged_bytes, media_type="image/png")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Spec normalizer — repairs LLM-generated JSON before rendering
@@ -212,7 +454,6 @@ def normalize_graph_spec(spec: dict) -> dict:
             spec["shapes"].append(shape)
 
     # 6. Normalise xrange / yrange
-    
     for range_key in ("xrange", "yrange"):
         val = spec.get(range_key)
         if val is None:
