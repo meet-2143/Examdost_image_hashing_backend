@@ -37,19 +37,6 @@ import io, json, re
 from copy import deepcopy
 
 
-from telethon import TelegramClient
-api_id = '33019221'
-api_hash = "41a12c735f8e8a3f61ae8ab402e16cd7"
-client = TelegramClient("session", api_id, api_hash)
-
-@app.on_event("startup")
-async def startup():
-    try:
-        await client.start()
-    except EOFError:
-        print("Warning: Telegram client has no valid session and no TTY to authenticate "
-              "interactively — /members will not work until session.session is set up on this host.")
-
 
 _LATEX_TEMPLATE = r"""\documentclass[11pt]{article}
 \usepackage[margin=1in]{geometry}
@@ -198,21 +185,6 @@ async def latex_to_pdf(request: Request):
 
     return Response(content=pdf_bytes, media_type="application/pdf")
 
-
-
-@app.get("/members")
-async def members():
-    group = await client.get_entity(-1003990692345)
-    participants = await client.get_participants(group)
-
-    return [
-        {
-            "id": p.id,
-            "name": p.first_name,
-            "username": p.username,
-        }
-        for p in participants
-    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

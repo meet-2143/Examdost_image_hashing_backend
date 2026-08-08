@@ -17,4 +17,3 @@ pymupdf
 schemdraw
 matplotlib
 pypandoc-binary
-telethon
